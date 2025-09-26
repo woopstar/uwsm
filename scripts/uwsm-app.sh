@@ -116,7 +116,7 @@ uwsm-terminal*)
 	*)
 		case "${UWSM_APP_UNIT_TYPE-}" in
 		service) set -- -t service "$@" ;;
-		scope)   set -- -t scope "$@" ;;
+		scope) set -- -t scope "$@" ;;
 		esac
 		;;
 	esac
@@ -164,7 +164,7 @@ while IFS='' read line; do
 done < "$PIPE_OUT"
 
 # kill timeout killer process and its sleep process
-kill $KILLER_PID $(ps --ppid $KILLER_PID -o pid= || true) >/dev/null 2>&1 || true &
+kill $KILLER_PID $(ps --ppid $KILLER_PID -o pid= || true) &
 
 case "$CMDLINE" in
 pong)
