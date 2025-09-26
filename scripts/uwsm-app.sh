@@ -66,23 +66,36 @@ KILLER_PID=$!
 # trap SIGPIPE
 trap 'error "Timed out waiting for pipes!" 141' PIPE
 
-# ---- Acquire a mutex: serialize one request/response over shared FIFOs ----
-lfd=
-exec {lfd}> "$LOCK_PATH"
-if command -v flock >/dev/null 2>&1; then
-	# block here until previous client finishes its round-trip
-	flock -x "$lfd"
+# only lock if daemon/pipes are not ready yet
+need_init=false
+if ! systemctl --user is-active --quiet "$DAEMON_UNIT" 2>/dev/null; then
+	need_init=true
+elif [ ! -p "$PIPE_IN" ] || [ ! -p "$PIPE_OUT" ]; then
+	need_init=true
 fi
 
-# Ensure server is up without sleeps:
-# If FIFOs are missing, create them; then start the daemon.
-# FIFO open/write will naturally block until the daemon opens the other end.
-if [ ! -p "$PIPE_IN" ] || [ ! -p "$PIPE_OUT" ]; then
-	[ -p "$PIPE_IN" ]  || mkfifo -m 0600 "$PIPE_IN"
-	[ -p "$PIPE_OUT" ] || mkfifo -m 0600 "$PIPE_OUT"
-	systemctl --user start "$DAEMON_UNIT" >/dev/null 2>&1 || true
+if $need_init; then
+	# acquire a mutex so only one client does the first-start dance
+	lfd=
+	exec {lfd}> "$LOCK_PATH"
+	if command -v flock >/dev/null 2>&1; then
+		flock -x "$lfd"
+	fi
+
+	# re-check inside lock (another client may have started it)
+	if ! systemctl --user is-active --quiet "$DAEMON_UNIT" 2>/dev/null \
+	   || [ ! -p "$PIPE_IN" ] || [ ! -p "$PIPE_OUT" ]; then
+		# start daemon synchronously; with Type=notify this returns when ready
+		systemctl --user start "$DAEMON_UNIT"
+	fi
+
+	# keep lock held only until we have a running daemon (no sleeps here)
+	# release lock now; normal request/response proceeds without holding it
+	if [ -n "$lfd" ]; then
+		exec {lfd}>&-
+	fi
 else
-	# this does nothing if it is already started
+	# daemon already up; ensure it's started (no-op if running)
 	systemctl --user start "$DAEMON_UNIT" >/dev/null 2>&1 || true
 fi
 
@@ -103,7 +116,7 @@ uwsm-terminal*)
 	*)
 		case "${UWSM_APP_UNIT_TYPE-}" in
 		service) set -- -t service "$@" ;;
-		scope)   set -- -t scope   "$@" ;;
+		scope)   set -- -t scope "$@" ;;
 		esac
 		;;
 	esac
@@ -113,8 +126,6 @@ esac
 # write args to input pipe
 if [ "$#" = "0" ]; then
 	echo "No args given!" >&2
-	# release lock before exit
-	if [ -n "$lfd" ]; then exec {lfd}>&-; fi
 	exit 1
 elif [ "$#" = "1" ] && [ "$1" = "ping" ]; then
 	printf '%s' 'ping' > "$PIPE_IN"
@@ -138,11 +149,8 @@ elif [ "$#" -ge "1" ] && {
 	esac
 } then
 	printf '%s\n' "Running 'uwsm app --help':" ""
-	# release lock before exec
-	if [ -n "$lfd" ]; then exec {lfd}>&-; fi
 	exec uwsm app -h
 else
-	# keep original protocol: NUL + "app" followed by each arg with the same format
 	printf '\0%s' app "$@" > "$PIPE_IN"
 fi
 
@@ -157,11 +165,6 @@ done < "$PIPE_OUT"
 
 # kill timeout killer process and its sleep process
 kill $KILLER_PID $(ps --ppid $KILLER_PID -o pid= || true) >/dev/null 2>&1 || true &
-
-# release the mutex before executing the returned command
-if [ -n "$lfd" ]; then
-	exec {lfd}>&-
-fi
 
 case "$CMDLINE" in
 pong)
